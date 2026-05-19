@@ -1,0 +1,19 @@
+apiVersion: backstage.io/v1beta1
+kind: Component
+metadata:
+  name: sqs-${{ values.name | lower }}
+  description: ${{ values.description or 'Fila SQS gerenciada por Terraform' }}
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    github.com/project-slug: gusta-lab/sqs-${{ values.name | lower }}
+  tags:
+    - aws
+    - sqs
+    - terraform
+spec:
+  type: queue
+  lifecycle: experimental
+  owner: user:default/gusta095
+  links:
+    - url: https://github.com/gusta-lab/sqs-${{ values.name | lower }}
+      title: GitHub repository

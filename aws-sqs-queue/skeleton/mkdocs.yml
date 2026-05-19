@@ -1,0 +1,6 @@
+site_name: sqs-${{ values.name }}
+site_description: Fila SQS gerenciada por Terraform
+plugins:
+  - techdocs-core
+nav:
+  - Introdução: index.md

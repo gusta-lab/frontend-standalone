@@ -1,0 +1,63 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: aws-sqs-queue
+  title: SQS Queue
+  description: Cria um repositório Terraform para provisionar uma fila SQS Standard na AWS.
+  tags: [aws, sqs, terraform, queue]
+spec:
+  owner: squad-infra
+  type: infrastructure
+
+  parameters:
+    - title: Configuração da fila
+      required: [name, environment]
+      properties:
+        name:
+          title: Nome da fila
+          type: string
+          description: Letras minúsculas, números e hífens
+          pattern: '^[a-z0-9\-]+$'
+          minLength: 3
+          maxLength: 60
+          ui:autofocus: true
+        environment:
+          title: Ambiente
+          type: string
+          enum: [sandbox, staging, production]
+          default: sandbox
+
+  steps:
+    - id: fetch
+      name: Gerar arquivos Terraform
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+          environment: ${{ parameters.environment }}
+
+    - id: publish
+      name: Criar repositório no GitHub
+      action: publish:github
+      input:
+        repoUrl: github.com?owner=gusta-lab&repo=sqs-${{ parameters.name }}
+        description: "Fila SQS: ${{ parameters.name }} (${{ parameters.environment }})"
+        defaultBranch: main
+        repoVisibility: private
+
+    - id: register
+      name: Registrar no catálogo
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
+        catalogInfoPath: '/catalog-info.yaml'
+
+  output:
+    links:
+      - title: Repositório GitHub
+        icon: github
+        url: ${{ steps.publish.output.remoteUrl }}
+      - title: Ver no catálogo
+        icon: catalog
+        entityRef: ${{ steps.register.output.entityRef }}
