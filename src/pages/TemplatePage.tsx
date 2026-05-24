@@ -2,10 +2,13 @@ import { useEffect, useState } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import {
   AlertCircle, Loader2, CheckCircle2, XCircle,
-  ChevronRight, Package, ExternalLink, RotateCcw, BookOpen,
+  ChevronRight, Package, ExternalLink, RotateCcw, BookOpen, Minus,
 } from 'lucide-react';
-import { getTemplate, submitTemplate, getTask } from '../api/backstage';
-import type { Template, TemplateProperty, ScaffolderTask } from '../types';
+import { getTemplate, submitTemplate, getTask, streamTask } from '../api/backstage';
+import type { StepStatus } from '../api/backstage';
+import { getLatestWorkflowRun, parseGithubRepo } from '../api/github';
+import type { WorkflowRun } from '../api/github';
+import type { Template, TemplateProperty, ScaffolderTask, ScaffoldOutput } from '../types';
 
 // ─── Field renderer ───────────────────────────────────────────────────────────
 
@@ -168,30 +171,61 @@ function Field({
   );
 }
 
+// ─── Step icon ────────────────────────────────────────────────────────────────
+
+function StepIcon({ status }: { status: StepStatus }) {
+  switch (status) {
+    case 'completed': return <CheckCircle2 size={20} className="text-green-500 flex-shrink-0" />;
+    case 'failed':    return <XCircle      size={20} className="text-red-400 flex-shrink-0"   />;
+    case 'skipped':   return <Minus        size={20} className="text-slate-300 flex-shrink-0" />;
+    case 'processing':return <Loader2      size={20} className="animate-spin text-indigo-500 flex-shrink-0" />;
+    default:          return <div className="w-5 h-5 rounded-full border-2 border-slate-300 bg-white flex-shrink-0" />;
+  }
+}
+
 // ─── Provisioning view ───────────────────────────────────────────────────────
+
+function stepColor(st: StepStatus) {
+  if (st === 'completed')  return 'text-slate-800';
+  if (st === 'failed')     return 'text-red-600';
+  if (st === 'processing') return 'text-indigo-700 font-semibold';
+  return 'text-slate-400';
+}
 
 function ProvisioningView({
   taskId,
+  provider,
   values,
   onRetry,
 }: {
   taskId: string;
+  provider: string | undefined;
   values: Record<string, unknown>;
   onRetry: () => void;
 }) {
   const navigate = useNavigate();
+
+  // ── Tempo decorrido ───────────────────────────────────────────────────────
+  const startedAt = useState(() => Date.now())[0];
+  const [elapsed, setElapsed] = useState(0);
+  const [finalElapsed, setFinalElapsed] = useState<number | null>(null);
+
+  // ── Fase 1: Backstage Scaffolder ─────────────────────────────────────────
   const [task, setTask] = useState<ScaffolderTask | null>(null);
+  const [stepStatuses, setStepStatuses] = useState<Record<string, StepStatus>>({});
+  const [scaffoldOutput, setScaffoldOutput] = useState<ScaffoldOutput | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
+    const ctrl = new AbortController();
 
     async function poll() {
       try {
         const t = await getTask(taskId);
         if (!active) return;
         setTask(t);
-        if (t.status !== 'completed' && t.status !== 'failed' && t.status !== 'cancelled') {
+        if (!['completed', 'failed', 'cancelled'].includes(t.status)) {
           setTimeout(poll, 2000);
         }
       } catch (err) {
@@ -199,22 +233,119 @@ function ProvisioningView({
       }
     }
 
+    async function startStream() {
+      try {
+        await streamTask(taskId, (stepId, status) => {
+          if (active) setStepStatuses(prev => ({ ...prev, [stepId]: status }));
+        }, (_result, output) => {
+          if (active) setScaffoldOutput(output);
+        }, ctrl.signal);
+      } catch { /* polling cobre */ }
+    }
+
     poll();
-    return () => { active = false; };
+    startStream();
+    return () => { active = false; ctrl.abort(); };
   }, [taskId]);
 
-  const status = task?.status ?? 'open';
-  const done = status === 'completed';
-  const failed = status === 'failed' || status === 'cancelled';
-  const processing = status === 'open' || status === 'processing';
+  const scaffoldStatus = task?.status ?? 'open';
+  const scaffoldDone   = scaffoldStatus === 'completed';
+  const scaffoldFailed = scaffoldStatus === 'failed' || scaffoldStatus === 'cancelled';
 
-  // Steps do spec (sempre disponíveis, só nomes)
-  const specSteps = task?.spec?.steps ?? [];
-
-  // Links do output (só disponíveis em completed)
-  const outputLinks = task?.output?.links ?? [];
-  const githubLink = outputLinks.find(l => l.url?.includes('github.com'));
+  const outputLinks = scaffoldOutput?.links ?? task?.output?.links ?? [];
+  const githubLink  = outputLinks.find(l => l.url?.includes('github.com'));
   const catalogLink = outputLinks.find(l => l.entityRef);
+
+  function getScaffoldStepStatus(stepId: string): StepStatus {
+    if (stepStatuses[stepId]) return stepStatuses[stepId];
+    if (scaffoldDone)   return 'completed';
+    if (scaffoldFailed) return 'failed';
+    return 'pending';
+  }
+
+  // ── Fase 2: GitHub Actions ────────────────────────────────────────────────
+  const [workflowRun, setWorkflowRun] = useState<WorkflowRun | null>(null);
+
+  useEffect(() => {
+    if (!scaffoldDone || !githubLink?.url) return;
+    const parsed = parseGithubRepo(githubLink.url);
+    if (!parsed) return;
+
+    let active = true;
+    let lastRun: WorkflowRun | null = null;
+
+    async function pollWorkflow() {
+      const run = await getLatestWorkflowRun(parsed!.owner, parsed!.repo);
+      if (!active) return;
+
+      // undefined = rate limit ou erro → preserva estado anterior
+      if (run !== undefined) {
+        lastRun = run;
+        setWorkflowRun(run);
+      }
+
+      if (lastRun?.status !== 'completed') {
+        setTimeout(pollWorkflow, 15000);
+      }
+    }
+
+    pollWorkflow();
+    return () => { active = false; };
+  }, [scaffoldDone, githubLink?.url]);
+
+  const infraDone   = workflowRun?.status === 'completed' && workflowRun.conclusion === 'success';
+  const infraFailed = workflowRun?.status === 'completed' && workflowRun.conclusion !== 'success';
+  const fullyDone   = scaffoldDone && infraDone;
+  const anyFailed   = scaffoldFailed || infraFailed;
+
+  useEffect(() => {
+    if (fullyDone || anyFailed) {
+      setFinalElapsed(prev => prev ?? Math.round((Date.now() - startedAt) / 1000));
+      return;
+    }
+    const id = setInterval(() => setElapsed(Math.round((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [fullyDone, anyFailed, startedAt]);
+
+  function formatElapsed(s: number) {
+    if (s < 60) return `${s}s`;
+    return `${Math.floor(s / 60)}m ${s % 60}s`;
+  }
+
+  const elapsedDisplay = finalElapsed !== null ? formatElapsed(finalElapsed) : formatElapsed(elapsed);
+
+  // Steps do GitHub Actions com status derivado do workflow run
+  const pipelineStarted = !!workflowRun && workflowRun.status !== 'queued';
+  const ghSteps: { label: string; status: StepStatus }[] = [
+    {
+      label: 'Configurar credenciais AWS',
+      status: infraFailed ? 'failed' : (pipelineStarted || infraDone) ? 'completed' : workflowRun ? 'processing' : 'pending',
+    },
+    {
+      label: 'Terraform Init',
+      status: infraFailed ? 'failed' : (pipelineStarted || infraDone) ? 'completed' : 'pending',
+    },
+    {
+      label: 'Terraform Apply',
+      status: infraFailed ? 'failed' : infraDone ? 'completed' : pipelineStarted ? 'processing' : 'pending',
+    },
+  ];
+
+  // Header geral
+  const overallStatus = !task
+    ? { icon: <Loader2 size={16} className="animate-spin text-slate-400" />, label: 'Conectando...' }
+    : scaffoldFailed
+    ? { icon: <XCircle size={16} className="text-red-500" />,      label: 'Falha ao criar repositório' }
+    : infraFailed
+    ? { icon: <XCircle size={16} className="text-red-500" />,      label: 'Falha no pipeline de infraestrutura' }
+    : fullyDone
+    ? { icon: <CheckCircle2 size={16} className="text-green-500" />, label: 'Recurso criado com sucesso' }
+    : scaffoldDone
+    ? { icon: <Loader2 size={16} className="animate-spin text-indigo-500" />, label: 'Aguardando pipeline AWS...' }
+    : { icon: <Loader2 size={16} className="animate-spin text-indigo-500" />, label: 'Criando repositório...' };
+
+  const scaffoldSteps = task?.spec?.steps ?? [];
+  const totalSteps    = scaffoldSteps.length + ghSteps.length;
 
   return (
     <div className="space-y-4">
@@ -237,74 +368,137 @@ function ProvisioningView({
                 </div>
               ))}
             </div>
-            <p className="text-xs text-slate-400 mt-3 font-mono">ID: {taskId.slice(0, 12)}</p>
+            <div className="flex items-center gap-6 mt-3">
+              <p className="text-xs text-slate-400 font-mono">ID: {taskId.slice(0, 12)}</p>
+              <p className="text-xs text-slate-400">
+                Duração:{' '}
+                <span className={`font-medium ${finalElapsed !== null ? 'text-slate-600' : 'text-indigo-500'}`}>
+                  {elapsedDisplay}
+                </span>
+              </p>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Progresso */}
+      {/* Trilha unificada */}
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-5 py-4 border-b border-slate-100 flex items-center gap-3">
-          {processing && <Loader2 size={16} className="animate-spin text-indigo-500 flex-shrink-0" />}
-          {done && <CheckCircle2 size={16} className="text-green-500 flex-shrink-0" />}
-          {failed && <XCircle size={16} className="text-red-500 flex-shrink-0" />}
-          {!task && <Loader2 size={16} className="animate-spin text-slate-400 flex-shrink-0" />}
-          <p className="text-sm font-semibold text-slate-700">
-            {!task && 'Conectando ao servidor...'}
-            {processing && 'Provisionando...'}
-            {done && 'Provisionamento concluído'}
-            {failed && 'Falha no provisionamento'}
-          </p>
+
+        {/* Header com status geral */}
+        <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            {overallStatus.icon}
+            <p className="text-sm font-semibold text-slate-700">{overallStatus.label}</p>
+          </div>
+          {scaffoldDone && githubLink?.url && (
+            <a
+              href={workflowRun?.html_url ?? `${githubLink.url}/actions`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-700 transition-colors flex-shrink-0"
+            >
+              <ExternalLink size={12} /> GitHub Actions
+            </a>
+          )}
         </div>
 
         {fetchError && (
-          <div className="px-5 py-4 flex items-center gap-2 text-red-600 text-sm">
+          <div className="px-5 py-3 flex items-center gap-2 text-red-600 text-sm border-b border-slate-100">
             <AlertCircle size={14} /> {fetchError}
           </div>
         )}
 
-        {/* Lista de steps (nomes) com estado visual baseado no status geral */}
-        {specSteps.length > 0 && (
-          <div className="px-5 py-4">
-            <div className="space-y-0">
-              {specSteps.map((step, i) => {
-                const isLast = i === specSteps.length - 1;
-                return (
-                  <div key={step.id} className="flex gap-4">
-                    <div className="flex flex-col items-center">
-                      {done ? (
-                        <CheckCircle2 size={20} className="text-green-500 flex-shrink-0" />
-                      ) : failed ? (
-                        <XCircle size={20} className="text-red-400 flex-shrink-0" />
-                      ) : (
-                        <div className="w-5 h-5 rounded-full border-2 border-slate-300 bg-white flex-shrink-0" />
-                      )}
-                      {!isLast && (
-                        <div className={`w-0.5 flex-1 my-1 min-h-4 ${done ? 'bg-green-200' : 'bg-slate-200'}`} />
-                      )}
+        {/* Steps */}
+        <div className="px-5 py-5">
+
+          {/* Fase 1: Backstage */}
+          {scaffoldSteps.length > 0 && (
+            <>
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
+                Repositório
+              </p>
+              <div className="mb-2">
+                {scaffoldSteps.map((step, i) => {
+                  const st = getScaffoldStepStatus(step.id);
+                  const isLastOfPhase = i === scaffoldSteps.length - 1;
+                  const lineColor = st === 'completed' ? 'bg-green-200' : 'bg-slate-200';
+                  return (
+                    <div key={step.id} className="flex gap-4">
+                      <div className="flex flex-col items-center">
+                        <StepIcon status={st} />
+                        {!(isLastOfPhase && ghSteps.length === 0) && (
+                          <div className={`w-0.5 flex-1 my-1 min-h-4 ${lineColor}`} />
+                        )}
+                      </div>
+                      <div className="pb-4">
+                        <p className={`text-sm ${stepColor(st)}`}>{step.name}</p>
+                      </div>
                     </div>
-                    <div className="pb-4">
-                      <p className={`text-sm font-medium ${done ? 'text-slate-800' : failed ? 'text-slate-500' : 'text-slate-400'}`}>
-                        {step.name}
-                      </p>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {/* Divisor entre fases */}
+          {scaffoldDone && (
+            <>
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 mt-1">
+                Pipeline AWS
+              </p>
+              <div>
+                {ghSteps.map((step, i) => {
+                  const isLast = i === ghSteps.length - 1;
+                  const lineColor = step.status === 'completed' ? 'bg-green-200' : 'bg-slate-200';
+                  return (
+                    <div key={step.label} className="flex gap-4">
+                      <div className="flex flex-col items-center">
+                        <StepIcon status={step.status} />
+                        {!isLast && (
+                          <div className={`w-0.5 flex-1 my-1 min-h-4 ${lineColor}`} />
+                        )}
+                      </div>
+                      <div className="pb-4">
+                        <p className={`text-sm ${stepColor(step.status)}`}>{step.label}</p>
+                      </div>
                     </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {/* Placeholder da fase 2 antes de iniciar */}
+          {!scaffoldDone && totalSteps > 0 && (
+            <div className="mt-1 ml-0">
+              <p className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
+                Pipeline AWS
+              </p>
+              {ghSteps.map(step => (
+                <div key={step.label} className="flex gap-4 opacity-30">
+                  <div className="flex flex-col items-center">
+                    <div className="w-5 h-5 rounded-full border-2 border-slate-300 bg-white flex-shrink-0" />
+                    <div className="w-0.5 flex-1 my-1 min-h-4 bg-slate-200" />
                   </div>
-                );
-              })}
+                  <div className="pb-4">
+                    <p className="text-sm text-slate-400">{step.label}</p>
+                  </div>
+                </div>
+              ))}
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
-      {/* Sucesso */}
-      {done && (
+      {/* Sucesso final */}
+      {fullyDone && (
         <div className="bg-green-50 border border-green-200 rounded-xl p-5">
           <div className="flex items-center gap-3 mb-4">
             <CheckCircle2 size={22} className="text-green-500 flex-shrink-0" />
             <div>
-              <p className="font-semibold text-green-900">Recurso provisionado com sucesso!</p>
+              <p className="font-semibold text-green-900">Recurso criado com sucesso!</p>
               <p className="text-sm text-green-700 mt-0.5">
-                Repositório criado e registrado no catálogo.
+                Fila SQS provisionada na AWS e registrada no catálogo.
               </p>
             </div>
           </div>
@@ -320,14 +514,12 @@ function ProvisioningView({
               </a>
             )}
             {catalogLink?.entityRef && (
-              <a
-                href={`http://localhost:3000/catalog/${catalogLink.entityRef.replace(':', '/')}`}
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                onClick={() => navigate(`/resources/${catalogLink.entityRef!.replace(':', '/')}`)}
                 className="flex items-center gap-2 px-4 py-2 bg-white border border-green-300 text-green-800 text-sm font-medium rounded-lg hover:bg-green-100 transition-colors"
               >
-                <BookOpen size={14} /> Ver no catálogo
-              </a>
+                <BookOpen size={14} /> Ver recurso
+              </button>
             )}
             <button
               onClick={() => navigate(provider ? `/providers/${provider}` : '/')}
@@ -340,24 +532,40 @@ function ProvisioningView({
       )}
 
       {/* Falha */}
-      {failed && (
+      {anyFailed && (
         <div className="bg-red-50 border border-red-200 rounded-xl p-5">
           <div className="flex items-center gap-3 mb-4">
             <XCircle size={22} className="text-red-500 flex-shrink-0" />
             <div>
-              <p className="font-semibold text-red-900">Falha no provisionamento</p>
+              <p className="font-semibold text-red-900">
+                {scaffoldFailed ? 'Falha ao criar repositório' : 'Falha no pipeline de infraestrutura'}
+              </p>
               <p className="text-sm text-red-700 mt-0.5">
-                Verifique as permissões e tente novamente.
+                {scaffoldFailed
+                  ? 'Verifique as permissões do Backstage e tente novamente.'
+                  : 'Verifique os logs do GitHub Actions e tente novamente.'}
               </p>
             </div>
           </div>
           <div className="flex gap-3">
-            <button
-              onClick={onRetry}
-              className="flex items-center gap-2 px-4 py-2 bg-white border border-red-300 text-red-700 text-sm font-medium rounded-lg hover:bg-red-100 transition-colors"
-            >
-              <RotateCcw size={14} /> Tentar novamente
-            </button>
+            {scaffoldFailed && (
+              <button
+                onClick={onRetry}
+                className="flex items-center gap-2 px-4 py-2 bg-white border border-red-300 text-red-700 text-sm font-medium rounded-lg hover:bg-red-100 transition-colors"
+              >
+                <RotateCcw size={14} /> Tentar novamente
+              </button>
+            )}
+            {infraFailed && githubLink?.url && (
+              <a
+                href={`${githubLink.url}/actions`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-4 py-2 bg-white border border-red-300 text-red-700 text-sm font-medium rounded-lg hover:bg-red-100 transition-colors"
+              >
+                <ExternalLink size={14} /> Ver logs
+              </a>
+            )}
             <button
               onClick={() => navigate('/orders')}
               className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-600 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors"
@@ -490,6 +698,7 @@ export function TemplatePage() {
       {taskId ? (
         <ProvisioningView
           taskId={taskId}
+          provider={provider}
           values={submittedValues}
           onRetry={() => { setTaskId(null); setError(null); }}
         />

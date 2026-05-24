@@ -4,6 +4,7 @@ import { HomePage } from './pages/HomePage';
 import { ProviderPage } from './pages/ProviderPage';
 import { TemplatePage } from './pages/TemplatePage';
 import { OrdersPage } from './pages/OrdersPage';
+import { ResourcePage } from './pages/ResourcePage';
 
 export function App() {
   return (
@@ -13,6 +14,7 @@ export function App() {
           <Route index element={<HomePage />} />
           <Route path="providers/:id" element={<ProviderPage />} />
           <Route path="templates/:name" element={<TemplatePage />} />
+          <Route path="resources/:kind/:namespace/:name" element={<ResourcePage />} />
           <Route path="orders" element={<OrdersPage />} />
           <Route path="notifications" element={<OrdersPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />

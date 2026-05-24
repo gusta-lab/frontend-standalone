@@ -39,6 +39,38 @@ export interface Template {
   };
 }
 
+export interface ScaffoldLink {
+  title: string;
+  url?: string;
+  entityRef?: string;
+  icon?: string;
+}
+
+export interface ScaffoldOutput {
+  links?: ScaffoldLink[];
+  text?: Array<{ title: string; content: string }>;
+}
+
+export interface CatalogEntity {
+  apiVersion: string;
+  kind: string;
+  metadata: {
+    name: string;
+    namespace?: string;
+    title?: string;
+    description?: string;
+    tags?: string[];
+    uid?: string;
+    annotations?: Record<string, string>;
+    links?: Array<{ url: string; title?: string; icon?: string }>;
+  };
+  spec: {
+    type?: string;
+    lifecycle?: string;
+    owner?: string;
+  };
+}
+
 export interface ScaffolderTask {
   id: string;
   spec: {

@@ -1,16 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom';
-import { Cloud, Tag, ArrowRight, AlertCircle, Loader2 } from 'lucide-react';
+import { Tag, ArrowRight, AlertCircle, Loader2 } from 'lucide-react';
 import { getTemplatesByProvider } from '../api/backstage';
+import { PROVIDER_DISPLAY, ProviderIcon, getProviderDisplay } from '../providers';
 import type { Template } from '../types';
-
-const PROVIDER_META: Record<string, { name: string; icon: JSX.Element; color: string }> = {
-  aws: {
-    name: 'AWS',
-    icon: <Cloud size={20} className="text-orange-400" />,
-    color: 'text-orange-400',
-  },
-};
 
 export function ProviderPage() {
   const { id } = useParams<{ id: string }>();
@@ -23,7 +16,7 @@ export function ProviderPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!id || !PROVIDER_META[id]) {
+    if (!id || !PROVIDER_DISPLAY[id]) {
       setError('Provedor não disponível ainda.');
       setLoading(false);
       return;
@@ -34,7 +27,8 @@ export function ProviderPage() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  const provider = PROVIDER_META[id ?? ''];
+  const provider = id ? getProviderDisplay(id) : null;
+
   const filtered = query
     ? templates.filter(
         t =>
@@ -44,7 +38,7 @@ export function ProviderPage() {
       )
     : templates;
 
-  if (!provider) {
+  if (!provider || !id || !PROVIDER_DISPLAY[id]) {
     return (
       <div className="flex items-center gap-2 text-slate-500">
         <AlertCircle size={16} /> Provedor desconhecido.
@@ -59,7 +53,7 @@ export function ProviderPage() {
         <Link to="/" className="hover:text-slate-800">Provedores</Link>
         <span>/</span>
         <span className="flex items-center gap-1 font-medium text-slate-800">
-          {provider.icon} {provider.name}
+          <ProviderIcon id={id} size={16} /> {provider.name}
         </span>
       </div>
 
@@ -86,7 +80,9 @@ export function ProviderPage() {
 
       {!loading && !error && filtered.length === 0 && (
         <div className="text-slate-500 text-sm">
-          {query ? `Nenhum template encontrado para "${query}".` : 'Nenhum template AWS disponível no catálogo.'}
+          {query
+            ? `Nenhum template encontrado para "${query}".`
+            : `Nenhum template ${provider.name} disponível no catálogo.`}
         </div>
       )}
 
@@ -98,8 +94,8 @@ export function ProviderPage() {
             className="bg-white border border-slate-200 rounded-xl p-5 cursor-pointer hover:shadow-md hover:border-indigo-200 transition-all group"
           >
             <div className="flex items-start gap-4">
-              <div className="w-10 h-10 rounded-lg bg-orange-50 border border-orange-100 flex items-center justify-center flex-shrink-0">
-                <Cloud size={20} className="text-orange-400" />
+              <div className={`w-10 h-10 rounded-lg ${provider.bgColor} flex items-center justify-center flex-shrink-0 border`}>
+                <ProviderIcon id={id} size={20} />
               </div>
               <div className="flex-1 min-w-0">
                 <p className="font-semibold text-slate-900 group-hover:text-indigo-600 transition-colors">
