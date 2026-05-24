@@ -5,6 +5,7 @@ import {
   Cloud, LayoutGrid, List, ChevronDown,
 } from 'lucide-react';
 import { getGustaLabResources } from '../api/backstage';
+import { getFileContent, parseTfvars, parseGithubRepo } from '../api/github';
 import type { CatalogEntity } from '../types';
 
 const PROVIDER_LABELS: Record<string, string> = { aws: 'AWS', gcp: 'GCP', azure: 'Azure' };
@@ -150,7 +151,7 @@ export function HomePage() {
 
         {resources !== null && filtered.length > 0 && (
           view === 'grid'
-            ? <ResourceGrid resources={filtered} onOpen={r => navigate(`/resources/${r.kind.toLowerCase()}/${r.metadata.namespace ?? 'default'}/${r.metadata.name}`)} />
+            ? <ResourceGrid resources={filtered} />
             : <ResourceList resources={filtered} onOpen={r => navigate(`/resources/${r.kind.toLowerCase()}/${r.metadata.namespace ?? 'default'}/${r.metadata.name}`)} />
         )}
       </div>
@@ -246,20 +247,41 @@ function FilterCheckbox({ label, checked, onChange }: { label: string; checked: 
   );
 }
 
-function ResourceCard({ resource, onOpen }: { resource: CatalogEntity; onOpen: () => void }) {
+function ResourceCard({ resource }: { resource: CatalogEntity }) {
+  const navigate = useNavigate();
   const provider = providerOf(resource);
   const type = resourceTypeOf(resource);
   const githubLink = githubLinkOf(resource);
+  const templateName = resource.metadata.annotations?.['gustalab.io/template'];
   const providerColor = PROVIDER_COLORS[provider] ?? 'bg-slate-50 text-slate-600 border-slate-200';
+  const [loading, setLoading] = useState(false);
+
+  async function handleClick() {
+    if (!githubLink || !templateName) return;
+    const parsed = parseGithubRepo(githubLink);
+    if (!parsed) return;
+
+    setLoading(true);
+    try {
+      const raw = await getFileContent(parsed.owner, parsed.repo, 'terraform.tfvars');
+      const prefill = raw ? { ...parseTfvars(raw), mode: 'update' } : { mode: 'update' };
+      navigate(`/templates/${templateName}`, { state: { provider, prefill } });
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
     <div
-      onClick={onOpen}
-      className="bg-white border border-slate-200 rounded-xl p-4 hover:shadow-md hover:border-indigo-200 transition-all cursor-pointer group"
+      onClick={handleClick}
+      className={`bg-white border border-slate-200 rounded-xl p-4 transition-all group
+        ${templateName ? 'hover:shadow-md hover:border-indigo-200 cursor-pointer' : ''}`}
     >
       <div className="flex items-start justify-between gap-2 mb-3">
         <div className="w-9 h-9 bg-slate-100 rounded-lg flex items-center justify-center flex-shrink-0">
-          <Cloud size={18} className="text-orange-400" />
+          {loading
+            ? <Loader2 size={16} className="animate-spin text-indigo-400" />
+            : <Cloud size={18} className="text-orange-400" />}
         </div>
         <span className={`text-xs font-medium px-2 py-0.5 rounded-full border ${providerColor}`}>
           {PROVIDER_LABELS[provider] ?? provider.toUpperCase()}
@@ -295,11 +317,11 @@ function ResourceCard({ resource, onOpen }: { resource: CatalogEntity; onOpen: (
   );
 }
 
-function ResourceGrid({ resources, onOpen }: { resources: CatalogEntity[]; onOpen: (r: CatalogEntity) => void }) {
+function ResourceGrid({ resources }: { resources: CatalogEntity[] }) {
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
       {resources.map(r => (
-        <ResourceCard key={r.metadata.uid ?? r.metadata.name} resource={r} onOpen={() => onOpen(r)} />
+        <ResourceCard key={r.metadata.uid ?? r.metadata.name} resource={r} />
       ))}
     </div>
   );

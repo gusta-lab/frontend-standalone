@@ -11,6 +11,7 @@ export interface TemplateProperty {
   minLength?: number;
   maxLength?: number;
   'ui:autofocus'?: boolean;
+  'ui:widget'?: string;
   items?: { type?: string; enum?: string[]; enumNames?: string[] };
   properties?: Record<string, TemplateProperty>;
   required?: string[];

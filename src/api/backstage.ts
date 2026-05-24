@@ -89,7 +89,7 @@ export async function listTasks(): Promise<ScaffolderTask[]> {
 
 export async function getGustaLabResources(): Promise<CatalogEntity[]> {
   return req<CatalogEntity[]>(
-    '/api/catalog/entities?filter=metadata.annotations.gustalab.io%2Fmanaged=true'
+    '/api/catalog/entities?filter=metadata.tags=gustalab-managed'
   );
 }
 

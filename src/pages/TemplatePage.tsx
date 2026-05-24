@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import {
   AlertCircle, Loader2, CheckCircle2, XCircle,
@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { getTemplate, submitTemplate, getTask, streamTask } from '../api/backstage';
 import type { StepStatus } from '../api/backstage';
-import { getLatestWorkflowRun, parseGithubRepo } from '../api/github';
+import { getLatestWorkflowRun, parseGithubRepo, parseGithubPR, getPRPlanComment, mergePR } from '../api/github';
 import type { WorkflowRun } from '../api/github';
 import type { Template, TemplateProperty, ScaffolderTask, ScaffoldOutput } from '../types';
 
@@ -25,6 +25,8 @@ function Field({
 }) {
   const base =
     'w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white';
+
+  if (schema['ui:widget'] === 'hidden') return null;
 
   if (schema.type === 'boolean') {
     return (
@@ -183,6 +185,259 @@ function StepIcon({ status }: { status: StepStatus }) {
   }
 }
 
+// ─── Terraform plan colorizer ────────────────────────────────────────────────
+
+function planLineColor(line: string): string {
+  const t = line.trimStart();
+  if (t.startsWith('+')) return 'text-green-600';
+  if (t.startsWith('-')) return 'text-red-500';
+  if (t.startsWith('~')) return 'text-yellow-600';
+  if (t.startsWith('#')) return 'text-indigo-500 font-semibold';
+  if (t.startsWith('Plan:')) return 'text-slate-900 font-semibold';
+  if (t.startsWith('<=')) return 'text-cyan-600';
+  return 'text-slate-500';
+}
+
+
+// ─── PR Review card ──────────────────────────────────────────────────────────
+
+function PRReviewCard({ prUrl, onBack }: { prUrl: string; onBack: () => void }) {
+  const [plan, setPlan] = useState<string | null>(null);
+  const [polling, setPolling] = useState(true);
+  const [merging, setMerging] = useState(false);
+  const [merged, setMerged] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [applyRun, setApplyRun] = useState<WorkflowRun | null | undefined>(undefined);
+  const preRunIdRef = useRef<number>(0);
+
+  const prInfo = parseGithubPR(prUrl);
+
+  // Fase 1: poll plan comment
+  useEffect(() => {
+    if (!prInfo) { setPolling(false); return; }
+    let active = true;
+    async function poll() {
+      const comment = await getPRPlanComment(prInfo!.owner, prInfo!.repo, prInfo!.number);
+      if (!active) return;
+      if (comment) { setPlan(comment); setPolling(false); }
+      else setTimeout(poll, 5000);
+    }
+    poll();
+    return () => { active = false; };
+  }, [prUrl]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fase 2: poll apply workflow após merge
+  useEffect(() => {
+    if (!merged || !prInfo) return;
+    let active = true;
+    let last: WorkflowRun | null = null;
+    async function poll() {
+      const run = await getLatestWorkflowRun(prInfo!.owner, prInfo!.repo);
+      if (!active) return;
+      if (run !== undefined) {
+        if (!run || run.id <= preRunIdRef.current) {
+          setTimeout(poll, 10000);
+          return;
+        }
+        last = run;
+        setApplyRun(run);
+      }
+      if (last?.status !== 'completed') setTimeout(poll, 10000);
+    }
+    poll();
+    return () => { active = false; };
+  }, [merged]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function handleMerge() {
+    if (!prInfo) return;
+    setMerging(true);
+    setMergeError(null);
+    try {
+      const currentRun = await getLatestWorkflowRun(prInfo.owner, prInfo.repo);
+      preRunIdRef.current = currentRun?.id ?? 0;
+      await mergePR(prInfo.owner, prInfo.repo, prInfo.number);
+      setMerged(true);
+    } catch (err) {
+      setMergeError((err as Error).message);
+    } finally {
+      setMerging(false);
+    }
+  }
+
+  // ── Fase 2 UI ──────────────────────────────────────────────────────────────
+  if (merged) {
+    const applyDone   = applyRun?.status === 'completed' && applyRun.conclusion === 'success';
+    const applyFailed = applyRun?.status === 'completed' && applyRun.conclusion !== 'success';
+    const started     = !!applyRun && applyRun.status !== 'queued';
+
+    const steps: { label: string; status: StepStatus }[] = [
+      {
+        label: 'Configurar credenciais AWS',
+        status: applyFailed ? 'failed' : (started || applyDone) ? 'completed' : applyRun ? 'processing' : 'pending',
+      },
+      {
+        label: 'Terraform Init',
+        status: applyFailed ? 'failed' : (started || applyDone) ? 'completed' : 'pending',
+      },
+      {
+        label: 'Terraform Apply',
+        status: applyFailed ? 'failed' : applyDone ? 'completed' : started ? 'processing' : 'pending',
+      },
+    ];
+
+    const headerLabel = !applyRun
+      ? 'Aguardando pipeline AWS...'
+      : applyDone   ? 'Mudanças aplicadas na AWS com sucesso!'
+      : applyFailed ? 'Falha no pipeline de infraestrutura'
+      : 'Aplicando mudanças na AWS...';
+
+    const headerIcon = !applyRun
+      ? <Loader2 size={16} className="animate-spin text-indigo-500" />
+      : applyDone   ? <CheckCircle2 size={16} className="text-green-500" />
+      : applyFailed ? <XCircle size={16} className="text-red-500" />
+      : <Loader2 size={16} className="animate-spin text-indigo-500" />;
+
+    return (
+      <div className="space-y-4">
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              {headerIcon}
+              <p className="text-sm font-semibold text-slate-700">{headerLabel}</p>
+            </div>
+            {applyRun?.html_url && (
+              <a href={applyRun.html_url} target="_blank" rel="noopener noreferrer"
+                className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-700 transition-colors flex-shrink-0">
+                <ExternalLink size={12} /> GitHub Actions
+              </a>
+            )}
+          </div>
+          <div className="px-5 py-5">
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Pipeline AWS</p>
+            {steps.map((step, i) => {
+              const isLast = i === steps.length - 1;
+              const lineColor = step.status === 'completed' ? 'bg-green-200' : 'bg-slate-200';
+              return (
+                <div key={step.label} className="flex gap-4">
+                  <div className="flex flex-col items-center">
+                    <StepIcon status={step.status} />
+                    {!isLast && <div className={`w-0.5 flex-1 my-1 min-h-4 ${lineColor}`} />}
+                  </div>
+                  <div className="pb-4">
+                    <p className={`text-sm ${stepColor(step.status)}`}>{step.label}</p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {applyDone && (
+          <div className="bg-green-50 border border-green-200 rounded-xl p-5">
+            <div className="flex items-center gap-3 mb-4">
+              <CheckCircle2 size={22} className="text-green-500 flex-shrink-0" />
+              <div>
+                <p className="font-semibold text-green-900">Mudanças aplicadas na AWS com sucesso!</p>
+                <p className="text-sm text-green-700 mt-0.5">A fila SQS foi atualizada.</p>
+              </div>
+            </div>
+            <button onClick={onBack}
+              className="px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors">
+              Voltar para recursos
+            </button>
+          </div>
+        )}
+
+        {applyFailed && (
+          <div className="bg-red-50 border border-red-200 rounded-xl p-5">
+            <div className="flex items-center gap-3 mb-4">
+              <XCircle size={22} className="text-red-500 flex-shrink-0" />
+              <div>
+                <p className="font-semibold text-red-900">Falha no pipeline de infraestrutura</p>
+                <p className="text-sm text-red-700 mt-0.5">Verifique os logs do GitHub Actions.</p>
+              </div>
+            </div>
+            <div className="flex gap-3">
+              {applyRun?.html_url && (
+                <a href={applyRun.html_url} target="_blank" rel="noopener noreferrer"
+                  className="flex items-center gap-2 px-4 py-2 bg-white border border-red-300 text-red-700 text-sm font-medium rounded-lg hover:bg-red-50 transition-colors">
+                  <ExternalLink size={14} /> Ver logs
+                </a>
+              )}
+              <button onClick={onBack}
+                className="px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors">
+                Voltar para recursos
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── Fase 1 UI: plan review ─────────────────────────────────────────────────
+  return (
+    <div className="bg-green-50 border border-green-200 rounded-xl p-5 space-y-4">
+      <div className="flex items-center gap-3">
+        <CheckCircle2 size={22} className="text-green-500 flex-shrink-0" />
+        <div>
+          <p className="font-semibold text-green-900">Pull Request aberto com sucesso!</p>
+          <p className="text-sm text-green-700 mt-0.5">
+            Revise o plano abaixo e confirme o merge para aplicar na AWS.
+          </p>
+        </div>
+      </div>
+
+      <div className="bg-white border border-green-200 rounded-lg overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2 border-b border-green-100">
+          <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Terraform Plan</p>
+          {polling && (
+            <span className="flex items-center gap-1.5 text-xs text-slate-400">
+              <Loader2 size={11} className="animate-spin" /> Aguardando plan...
+            </span>
+          )}
+        </div>
+        <div className="text-xs p-4 overflow-x-auto max-h-72 leading-relaxed font-mono whitespace-pre">
+          {polling ? (
+            <span className="text-slate-400 whitespace-normal">O Terraform Plan está sendo executado no GitHub Actions...</span>
+          ) : (
+            (plan ?? 'Nenhum output encontrado.').split(/\r?\n/).map((line, i) => (
+              <div key={i} className={planLineColor(line)}>{line || ' '}</div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {mergeError && (
+        <div className="flex items-center gap-2 text-red-600 text-sm bg-red-50 border border-red-200 rounded-lg px-4 py-3">
+          <AlertCircle size={14} /> {mergeError}
+        </div>
+      )}
+
+      <div className="flex flex-wrap gap-3">
+        <button
+          onClick={handleMerge}
+          disabled={polling || merging}
+          className="flex items-center gap-2 px-4 py-2 bg-green-700 text-white text-sm font-medium rounded-lg hover:bg-green-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {merging
+            ? <><Loader2 size={14} className="animate-spin" /> Fazendo merge...</>
+            : <><CheckCircle2 size={14} /> Confirmar merge</>}
+        </button>
+        <a href={prUrl} target="_blank" rel="noopener noreferrer"
+          className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors">
+          <ExternalLink size={14} /> Ver Pull Request
+        </a>
+        <button onClick={onBack}
+          className="px-4 py-2 bg-white border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors">
+          Voltar para recursos
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
 // ─── Provisioning view ───────────────────────────────────────────────────────
 
 function stepColor(st: StepStatus) {
@@ -204,6 +459,7 @@ function ProvisioningView({
   onRetry: () => void;
 }) {
   const navigate = useNavigate();
+  const isUpdate = values.mode === 'update';
 
   // ── Tempo decorrido ───────────────────────────────────────────────────────
   const startedAt = useState(() => Date.now())[0];
@@ -267,7 +523,7 @@ function ProvisioningView({
   const [workflowRun, setWorkflowRun] = useState<WorkflowRun | null>(null);
 
   useEffect(() => {
-    if (!scaffoldDone || !githubLink?.url) return;
+    if (isUpdate || !scaffoldDone || !githubLink?.url) return;
     const parsed = parseGithubRepo(githubLink.url);
     if (!parsed) return;
 
@@ -295,7 +551,7 @@ function ProvisioningView({
 
   const infraDone   = workflowRun?.status === 'completed' && workflowRun.conclusion === 'success';
   const infraFailed = workflowRun?.status === 'completed' && workflowRun.conclusion !== 'success';
-  const fullyDone   = scaffoldDone && infraDone;
+  const fullyDone   = isUpdate ? scaffoldDone : (scaffoldDone && infraDone);
   const anyFailed   = scaffoldFailed || infraFailed;
 
   useEffect(() => {
@@ -335,14 +591,14 @@ function ProvisioningView({
   const overallStatus = !task
     ? { icon: <Loader2 size={16} className="animate-spin text-slate-400" />, label: 'Conectando...' }
     : scaffoldFailed
-    ? { icon: <XCircle size={16} className="text-red-500" />,      label: 'Falha ao criar repositório' }
+    ? { icon: <XCircle size={16} className="text-red-500" />, label: isUpdate ? 'Falha ao abrir Pull Request' : 'Falha ao criar repositório' }
     : infraFailed
-    ? { icon: <XCircle size={16} className="text-red-500" />,      label: 'Falha no pipeline de infraestrutura' }
+    ? { icon: <XCircle size={16} className="text-red-500" />, label: 'Falha no pipeline de infraestrutura' }
     : fullyDone
-    ? { icon: <CheckCircle2 size={16} className="text-green-500" />, label: 'Recurso criado com sucesso' }
-    : scaffoldDone
+    ? { icon: <CheckCircle2 size={16} className="text-green-500" />, label: isUpdate ? 'Pull Request aberto com sucesso' : 'Recurso criado com sucesso' }
+    : scaffoldDone && !isUpdate
     ? { icon: <Loader2 size={16} className="animate-spin text-indigo-500" />, label: 'Aguardando pipeline AWS...' }
-    : { icon: <Loader2 size={16} className="animate-spin text-indigo-500" />, label: 'Criando repositório...' };
+    : { icon: <Loader2 size={16} className="animate-spin text-indigo-500" />, label: isUpdate ? 'Abrindo Pull Request...' : 'Criando repositório...' };
 
   const scaffoldSteps = task?.spec?.steps ?? [];
   const totalSteps    = scaffoldSteps.length + ghSteps.length;
@@ -361,12 +617,14 @@ function ProvisioningView({
               Resumo do pedido
             </p>
             <div className="grid grid-cols-2 gap-x-6 gap-y-1.5">
-              {Object.entries(values).map(([key, val]) => (
-                <div key={key} className="flex items-center gap-2 text-sm">
-                  <span className="text-slate-400 capitalize">{key.replace(/_/g, ' ')}:</span>
-                  <span className="font-medium text-slate-800">{String(val)}</span>
-                </div>
-              ))}
+              {Object.entries(values)
+                .filter(([key]) => !['mode', 'state_bucket'].includes(key))
+                .map(([key, val]) => (
+                  <div key={key} className="flex items-center gap-2 text-sm">
+                    <span className="text-slate-400 capitalize">{key.replace(/_/g, ' ')}:</span>
+                    <span className="font-medium text-slate-800">{String(val)}</span>
+                  </div>
+                ))}
             </div>
             <div className="flex items-center gap-6 mt-3">
               <p className="text-xs text-slate-400 font-mono">ID: {taskId.slice(0, 12)}</p>
@@ -392,12 +650,12 @@ function ProvisioningView({
           </div>
           {scaffoldDone && githubLink?.url && (
             <a
-              href={workflowRun?.html_url ?? `${githubLink.url}/actions`}
+              href={isUpdate ? githubLink.url : (workflowRun?.html_url ?? `${githubLink.url}/actions`)}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-700 transition-colors flex-shrink-0"
             >
-              <ExternalLink size={12} /> GitHub Actions
+              <ExternalLink size={12} /> {isUpdate ? 'Ver Pull Request' : 'GitHub Actions'}
             </a>
           )}
         </div>
@@ -441,7 +699,7 @@ function ProvisioningView({
           )}
 
           {/* Divisor entre fases */}
-          {scaffoldDone && (
+          {scaffoldDone && !isUpdate && (
             <>
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 mt-1">
                 Pipeline AWS
@@ -469,7 +727,7 @@ function ProvisioningView({
           )}
 
           {/* Placeholder da fase 2 antes de iniciar */}
-          {!scaffoldDone && totalSteps > 0 && (
+          {!isUpdate && !scaffoldDone && totalSteps > 0 && (
             <div className="mt-1 ml-0">
               <p className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
                 Pipeline AWS
@@ -491,7 +749,14 @@ function ProvisioningView({
       </div>
 
       {/* Sucesso final */}
-      {fullyDone && (
+      {fullyDone && isUpdate && githubLink?.url && (
+        <PRReviewCard
+          prUrl={githubLink.url}
+          onBack={() => navigate('/')}
+        />
+      )}
+
+      {fullyDone && !isUpdate && (
         <div className="bg-green-50 border border-green-200 rounded-xl p-5">
           <div className="flex items-center gap-3 mb-4">
             <CheckCircle2 size={22} className="text-green-500 flex-shrink-0" />
@@ -614,7 +879,9 @@ function collectRequired(template: Template): Set<string> {
 export function TemplatePage() {
   const { name } = useParams<{ name: string }>();
   const location = useLocation();
-  const provider = (location.state as { provider?: string } | null)?.provider;
+  const state = location.state as { provider?: string; prefill?: Record<string, unknown> } | null;
+  const provider = state?.provider;
+  const prefill  = state?.prefill;
   const [template, setTemplate] = useState<Template | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -628,7 +895,7 @@ export function TemplatePage() {
     getTemplate(name)
       .then(t => {
         setTemplate(t);
-        setValues(buildInitialValues(t));
+        setValues({ ...buildInitialValues(t), ...(prefill ?? {}) });
       })
       .catch(err => setError((err as Error).message))
       .finally(() => setLoading(false));
@@ -688,10 +955,17 @@ export function TemplatePage() {
 
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-slate-900">
-          {template.metadata.title ?? template.metadata.name}
+          {prefill?.mode === 'update'
+            ? `Editar: ${String(prefill.queue_name ?? '')}`
+            : (template.metadata.title ?? template.metadata.name)}
         </h1>
         {template.metadata.description && (
           <p className="text-slate-500 mt-1">{template.metadata.description}</p>
+        )}
+        {prefill?.mode === 'update' && (
+          <p className="text-sm text-indigo-600 mt-1">
+            As alterações serão submetidas como Pull Request para revisão antes de serem aplicadas.
+          </p>
         )}
       </div>
 
@@ -735,6 +1009,8 @@ export function TemplatePage() {
             >
               {submitting ? (
                 <><Loader2 size={16} className="animate-spin" /> Enviando...</>
+              ) : prefill?.mode === 'update' ? (
+                <>Abrir Pull Request <ChevronRight size={16} /></>
               ) : (
                 <>Provisionar recurso <ChevronRight size={16} /></>
               )}
